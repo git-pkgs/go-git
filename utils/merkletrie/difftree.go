@@ -374,6 +374,9 @@ func diffNodes(changes *Changes, ii *doubleIter) error {
 func diffNodesSameName(changes *Changes, ii *doubleIter) error {
 	from := ii.from.current
 	to := ii.to.current
+	if ii.hashEqual(from, to) {
+		return ii.nextBoth()
+	}
 
 	status, err := ii.compare()
 	if err != nil {
@@ -381,11 +384,6 @@ func diffNodesSameName(changes *Changes, ii *doubleIter) error {
 	}
 
 	switch {
-	case status.sameHash:
-		// do nothing
-		if err = ii.nextBoth(); err != nil {
-			return err
-		}
 	case status.bothAreFiles:
 		changes.Add(NewModify(from, to))
 		if err = ii.nextBoth(); err != nil {
