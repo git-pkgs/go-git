@@ -12,10 +12,11 @@ import (
 )
 
 type commitPreIterator struct {
-	seenExternal map[plumbing.Hash]bool
-	seen         map[plumbing.Hash]bool
-	stack        []CommitIter
-	start        *Commit
+	seenExternal     map[plumbing.Hash]bool
+	seenExternalFunc func(plumbing.Hash) bool
+	seen             map[plumbing.Hash]bool
+	stack            []CommitIter
+	start            *Commit
 }
 
 func forEachCommit(next func() (*Commit, error), cb func(*Commit) error) error {
@@ -88,7 +89,7 @@ func (w *commitPreIterator) Next() (*Commit, error) {
 			}
 		}
 
-		if w.seen[c.Hash] || w.seenExternal[c.Hash] {
+		if w.seen[c.Hash] || w.seenExternal[c.Hash] || w.seenExternalFunc != nil && w.seenExternalFunc(c.Hash) {
 			continue
 		}
 
@@ -288,8 +289,25 @@ func addReference(
 	}
 
 	refCommit, _ := GetCommit(repoStorer, ref.Hash())
-	if refCommit == nil {
-		// if it's not a commit - skip it.
+	target := ref.Hash()
+	for refCommit == nil {
+		tag, err := GetTag(repoStorer, target)
+		if err != nil {
+			return nil
+		}
+		target = tag.Target
+		if tag.TargetType == plumbing.TagObject {
+			continue
+		}
+		if tag.TargetType != plumbing.CommitObject {
+			return nil
+		}
+		refCommit, err = GetCommit(repoStorer, target)
+		if err != nil {
+			return err
+		}
+	}
+	if _, exists := commitsLookup[refCommit.Hash]; exists {
 		return nil
 	}
 
@@ -299,15 +317,33 @@ func addReference(
 	)
 	// collect all ref commits to add
 	commitIter := commitIterFunc(refCommit)
-	for c, e := commitIter.Next(); e == nil; {
-		parent, exists = commitsLookup[c.Hash]
-		if exists {
+	defer commitIter.Close()
+	seen := func(hash plumbing.Hash) bool {
+		entry, exists := commitsLookup[hash]
+		if exists && parent == nil {
+			parent = entry
+		}
+		return exists
+	}
+	switch iter := commitIter.(type) {
+	case *commitPreIterator:
+		iter.seenExternalFunc = seen
+	case *commitIteratorByCTime:
+		iter.seenExternalFunc = seen
+	}
+	for {
+		c, err := commitIter.Next()
+		if err == io.EOF {
 			break
 		}
+		if err != nil {
+			return err
+		}
+		if seen(c.Hash) {
+			continue
+		}
 		refCommits = append(refCommits, c)
-		c, e = commitIter.Next()
 	}
-	commitIter.Close()
 
 	if parent == nil {
 		// common parent - not found

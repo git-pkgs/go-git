@@ -11,9 +11,10 @@ import (
 )
 
 type commitIteratorByCTime struct {
-	seenExternal map[plumbing.Hash]bool
-	seen         map[plumbing.Hash]bool
-	heap         *binaryheap.Heap
+	seenExternal     map[plumbing.Hash]bool
+	seenExternalFunc func(plumbing.Hash) bool
+	seen             map[plumbing.Hash]bool
+	heap             *binaryheap.Heap
 }
 
 // NewCommitIterCTime returns a CommitIter that walks the commit history,
@@ -58,7 +59,7 @@ func (w *commitIteratorByCTime) Next() (*Commit, error) {
 		}
 		c = cIn.(*Commit)
 
-		if w.seen[c.Hash] || w.seenExternal[c.Hash] {
+		if w.seen[c.Hash] || w.seenExternal[c.Hash] || w.seenExternalFunc != nil && w.seenExternalFunc(c.Hash) {
 			continue
 		}
 
