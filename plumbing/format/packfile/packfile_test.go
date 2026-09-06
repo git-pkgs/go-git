@@ -210,7 +210,6 @@ func TestObjectInfosByType(t *testing.T) {
 		plumbing.TreeObject,
 		plumbing.BlobObject,
 	} {
-		typ := typ
 		packs := fixtures.ByTag("packfile")
 		packs.Run(t, func(t *testing.T, f *fixtures.Fixture) {
 			t.Parallel()

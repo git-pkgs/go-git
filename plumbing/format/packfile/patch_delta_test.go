@@ -181,6 +181,8 @@ func TestReaderFromDeltaRejectsOversizedCopies(t *testing.T) {
 }
 
 func TestReaderFromDeltaTracksPositionAfterRewind(t *testing.T) {
+	t.Parallel()
+
 	base := &plumbing.MemoryObject{}
 	_, err := base.Write([]byte("abcdefghijklmnopqrstuvwxyz"))
 	require.NoError(t, err)

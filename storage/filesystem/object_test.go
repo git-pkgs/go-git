@@ -37,9 +37,11 @@ var objectTypes = []plumbing.ObjectType{
 }
 
 func TestNewStoragePassesPoolToObjectStorage(t *testing.T) {
+	t.Parallel()
+
 	storage := NewStorage(osfs.New(t.TempDir()), cache.NewObjectLRUDefault())
 	defer func() { _ = storage.Close() }()
-	require.NotNil(t, storage.ObjectStorage.options.Pool)
+	require.NotNil(t, storage.options.Pool)
 }
 
 func TestFsSuite(t *testing.T) {

@@ -419,7 +419,7 @@ func (p *Packfile) headerFromOffset(offset int64, h plumbing.Hash) (*ObjectHeade
 			return err
 		})
 		if !errors.Is(err, errors.ErrUnsupported) {
-			if err != nil && !(err == io.EOF && oh != nil) {
+			if err != nil && (err != io.EOF || oh == nil) {
 				return nil, err
 			}
 			oh.Hash = h
@@ -481,7 +481,8 @@ func readObjectHeaderBytes(data []byte, offset int64, objectIDSize int) (*Object
 	if typ.IsDelta() {
 		oh.Hash.ResetBySize(objectIDSize)
 	}
-	if typ == plumbing.OFSDeltaObject {
+	switch typ {
+	case plumbing.OFSDeltaObject:
 		c, err := readByte()
 		if err != nil {
 			return nil, err
@@ -502,7 +503,7 @@ func readObjectHeaderBytes(data []byte, offset int64, objectIDSize int) (*Object
 			return nil, err
 		}
 		oh.OffsetReference = offset - base
-	} else if typ == plumbing.REFDeltaObject {
+	case plumbing.REFDeltaObject:
 		oh.Reference.ResetBySize(objectIDSize)
 		if len(data)-pos < objectIDSize {
 			if len(data) == pos {

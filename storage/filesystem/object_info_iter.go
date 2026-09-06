@@ -224,7 +224,7 @@ func (i *packfileObjectInfoIter) Next() (ObjectInfo, error) {
 		object := objectFromPackInfo(info)
 		var packInfo *packfile.ObjectInfo
 		if object == nil {
-			packInfo = retainPackInfo(info)
+			packInfo = new(info)
 		}
 		return ObjectInfo{
 			Hash: info.Hash, Type: info.Type, Size: info.Size,
@@ -232,10 +232,6 @@ func (i *packfileObjectInfoIter) Next() (ObjectInfo, error) {
 			packInfo: packInfo, object: object,
 		}, nil
 	}
-}
-
-func retainPackInfo(info packfile.ObjectInfo) *packfile.ObjectInfo {
-	return &info
 }
 
 func objectFromPackInfo(info packfile.ObjectInfo) plumbing.EncodedObject {

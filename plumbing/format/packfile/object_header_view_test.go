@@ -32,7 +32,7 @@ func TestReadObjectHeaderBytesMatchesScanner(t *testing.T) {
 				scannerOpts = append(scannerOpts, WithSHA256())
 			}
 			scanner := NewScanner(bytes.NewReader(data), scannerOpts...)
-			scanner.scannerReader.offset = 100
+			scanner.offset = 100
 			want, err := scanner.readObjectHeader()
 			require.NoError(t, err)
 
