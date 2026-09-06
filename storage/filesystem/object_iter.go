@@ -64,7 +64,7 @@ func (it *lazyPackfilesIter) Close() {
 }
 
 type packfileIter struct {
-	pack billy.File
+	pack io.Closer
 	iter storer.EncodedObjectIter
 	seen map[plumbing.Hash]struct{}
 

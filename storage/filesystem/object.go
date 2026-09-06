@@ -1021,17 +1021,19 @@ func (s *ObjectStorage) buildPackfileIters(
 	return &lazyPackfilesIter{
 		hashes: packs,
 		open: func(h plumbing.Hash) (storer.EncodedObjectIter, error) {
-			pack, err := s.dir.OpenPackForReading(h)
-			if err != nil {
-				return nil, err
-			}
 			s.muI.RLock()
 			idx := s.index[h]
 			s.muI.RUnlock()
-			return newPackfileIter(
-				s.dir.Fs(), pack, t, seen, idx,
-				s.objectCache, false, h.Size(),
-			)
+			pack, err := s.packfile(idx, h)
+			if err != nil {
+				return nil, err
+			}
+			iter, err := pack.GetByType(t)
+			if err != nil {
+				_ = pack.Close()
+				return nil, err
+			}
+			return &packfileIter{pack: pack, iter: iter, seen: seen}, nil
 		},
 	}, nil
 }
