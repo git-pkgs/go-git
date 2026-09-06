@@ -14,9 +14,8 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/format/config"
 )
 
-var input = strings.Repeat("43aec75c611f22c73b27ece2841e6ccca592f2", 50000000)
-
 func BenchmarkReadFrom(b *testing.B) {
+	input := strings.Repeat("43aec75c611f22c73b27ece2841e6ccca592f2", 50000000)
 	raw, err := hex.DecodeString(input)
 	require.NoError(b, err)
 

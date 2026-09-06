@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	iofs "io/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -33,6 +34,12 @@ var objectTypes = []plumbing.ObjectType{
 	plumbing.TagObject,
 	plumbing.TreeObject,
 	plumbing.BlobObject,
+}
+
+func TestNewStoragePassesPoolToObjectStorage(t *testing.T) {
+	storage := NewStorage(osfs.New(t.TempDir()), cache.NewObjectLRUDefault())
+	defer func() { _ = storage.Close() }()
+	require.NotNil(t, storage.ObjectStorage.options.Pool)
 }
 
 func TestFsSuite(t *testing.T) {
@@ -309,6 +316,128 @@ func (s *FsSuite) TestIter() {
 		s.Require().NoError(err)
 		s.Equal(f.ObjectsCount, count)
 	}
+}
+
+func (s *FsSuite) TestIterObjectInfosMatchesEncodedObjects() {
+	for _, fixture := range []*fixtures.Fixture{
+		fixtures.Basic().ByTag(".git").ByObjectFormat("sha1").One(),
+		fixtures.ByTag(".git").ByTag("unpacked").One(),
+	} {
+		fs, err := fixture.DotGit()
+		s.Require().NoError(err)
+		storage := NewStorage(fs, cache.NewObjectLRUDefault())
+		s.T().Cleanup(func() { _ = storage.Close() })
+
+		infos := make(map[plumbing.Hash]ObjectInfo)
+		infoIter, err := storage.IterObjectInfos(plumbing.AnyObject)
+		s.Require().NoError(err)
+		err = infoIter.ForEach(func(info ObjectInfo) error {
+			obj, err := storage.EncodedObjectFromInfo(info)
+			s.Require().NoError(err)
+			s.Equal(info.Hash, obj.Hash())
+			s.Equal(info.Type, obj.Type())
+			s.Equal(info.Size, obj.Size())
+			infos[info.Hash] = info
+			return nil
+		})
+		s.Require().NoError(err)
+
+		objectIter, err := storage.IterEncodedObjects(plumbing.AnyObject)
+		s.Require().NoError(err)
+		var objects int
+		err = objectIter.ForEach(func(obj plumbing.EncodedObject) error {
+			info, ok := infos[obj.Hash()]
+			s.True(ok, obj.Hash().String())
+			s.Equal(obj.Type(), info.Type)
+			s.Equal(obj.Size(), info.Size)
+			objects++
+			return nil
+		})
+		s.Require().NoError(err)
+		s.Len(infos, objects)
+	}
+}
+
+func (s *FsSuite) TestObjectInfoReader() {
+	for _, fixture := range []*fixtures.Fixture{
+		fixtures.Basic().ByTag(".git").ByObjectFormat("sha1").One(),
+		fixtures.ByTag(".git").ByTag("unpacked").One(),
+	} {
+		fs, err := fixture.DotGit()
+		s.Require().NoError(err)
+		storage := NewStorage(fs, cache.NewObjectLRUDefault())
+		s.T().Cleanup(func() { _ = storage.Close() })
+
+		iter, err := storage.IterObjectInfos(plumbing.AnyObject)
+		s.Require().NoError(err)
+		reader := storage.NewObjectInfoReader()
+		var last ObjectInfo
+		err = iter.ForEach(func(info ObjectInfo) error {
+			obj, err := reader.EncodedObject(info)
+			s.Require().NoError(err)
+			s.Equal(info.Hash, obj.Hash())
+			s.Equal(info.Type, obj.Type())
+			s.Equal(info.Size, obj.Size())
+			contents, err := obj.Reader()
+			s.Require().NoError(err)
+			data, err := io.ReadAll(contents)
+			s.Require().NoError(err)
+			s.Require().NoError(contents.Close())
+			s.Len(data, int(info.Size))
+			last = info
+			return nil
+		})
+		s.Require().NoError(err)
+		s.Require().NoError(reader.Close())
+		s.Require().NoError(reader.Close())
+		_, err = reader.EncodedObject(last)
+		s.ErrorIs(err, iofs.ErrClosed)
+	}
+}
+
+func (s *FsSuite) TestDeferredDeltaInfoLoadsAfterIteratorClose() {
+	for _, fixture := range fixtures.ByTag(".git").ByTag("packfile").ByObjectFormat("sha1") {
+		fs, err := fixture.DotGit()
+		s.Require().NoError(err)
+		storage := NewStorage(fs, cache.NewObjectLRUDefault())
+
+		iter, err := storage.IterObjectInfos(plumbing.BlobObject)
+		s.Require().NoError(err)
+		var deferred ObjectInfo
+		for {
+			info, err := iter.Next()
+			if err == io.EOF {
+				break
+			}
+			s.Require().NoError(err)
+			if info.packed && info.object == nil {
+				deferred = info
+				break
+			}
+		}
+		iter.Close()
+		if deferred.Hash.IsZero() {
+			s.Require().NoError(storage.Close())
+			continue
+		}
+
+		infoReader := storage.NewObjectInfoReader()
+		obj, err := infoReader.EncodedObject(deferred)
+		s.Require().NoError(err)
+		s.Equal(deferred.Hash, obj.Hash())
+		s.Equal(deferred.Type, obj.Type())
+		s.Equal(deferred.Size, obj.Size())
+		reader, err := obj.Reader()
+		s.Require().NoError(err)
+		data, err := io.ReadAll(reader)
+		s.Require().NoError(err)
+		s.Require().NoError(reader.Close())
+		s.Len(data, int(deferred.Size))
+		s.Require().NoError(infoReader.Close())
+		s.Require().NoError(storage.Close())
+		return
+	}
+	s.T().Fatal("fixture set has no packed delta blob")
 }
 
 func (s *FsSuite) TestIterLargeObjectThreshold() {

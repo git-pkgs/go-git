@@ -342,6 +342,18 @@ func (r *Scanner) inflateContent(contentOffset int64, writer io.Writer, declared
 	return err
 }
 
+func (r *Scanner) deltaTargetSize(contentOffset int64) (int64, error) {
+	if _, err := r.Seek(contentOffset, io.SeekStart); err != nil {
+		return 0, err
+	}
+	zr, err := gogitsync.GetZlibReader(r.scannerReader)
+	if err != nil {
+		return 0, fmt.Errorf("zlib reset error: %w", err)
+	}
+	defer gogitsync.PutZlibReader(zr)
+	return readDeltaTargetSize(zr)
+}
+
 // scan goes through the next stateFn.
 //
 // State functions are chained by returning a non-nil value for stateFn.
@@ -438,13 +450,65 @@ func objectEntry(r *Scanner) (stateFn, error) {
 	}
 	r.objIndex++
 
-	offset := r.offset
-
 	if err := r.Flush(); err != nil {
 		return nil, err
 	}
 	r.crc.Reset()
 
+	oh, err := r.readObjectHeader()
+	if err != nil {
+		return nil, err
+	}
+
+	zr, err := gogitsync.GetZlibReader(r.scannerReader)
+	if err != nil {
+		return nil, fmt.Errorf("zlib reset error: %w", err)
+	}
+	defer gogitsync.PutZlibReader(zr)
+
+	mw := io.Discard
+	if !oh.Type.IsDelta() {
+		r.hasher.Reset(oh.Type, oh.Size)
+		mw = r.hasher
+		if r.storage != nil {
+			w, err := r.storage.RawObjectWriter(oh.Type, oh.Size)
+			if err != nil {
+				return nil, err
+			}
+
+			defer func() { _ = w.Close() }()
+			mw = io.MultiWriter(r.hasher, w)
+		}
+	}
+
+	// Unseekable inputs and delta resolution need the inflated bytes.
+	if !r.lowMemoryMode && (oh.Type.IsDelta() || r.seeker == nil) {
+		oh.content = gogitsync.GetBytesBuffer()
+		mw = io.MultiWriter(mw, oh.content)
+	}
+
+	mw = &boundedWriter{w: mw, limit: oh.Size}
+	_, err = ioutil.CopyBufferPool(mw, zr)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := r.Flush(); err != nil {
+		return nil, err
+	}
+
+	oh.Crc32 = r.crc.Sum32()
+	if !oh.Type.IsDelta() {
+		oh.Hash = r.hasher.Sum()
+	}
+
+	r.packData.Section = ObjectSection
+	r.packData.objectHeader = *oh
+	return nil, nil
+}
+
+func (r *Scanner) readObjectHeader() (*ObjectHeader, error) {
+	offset := r.offset
 	b := []byte{0}
 	_, err := r.Read(b)
 	if err != nil {
@@ -495,61 +559,7 @@ func objectEntry(r *Scanner) (stateFn, error) {
 	}
 
 	oh.ContentOffset = r.offset
-
-	zr, err := gogitsync.GetZlibReader(r.scannerReader)
-	if err != nil {
-		return nil, fmt.Errorf("zlib reset error: %w", err)
-	}
-	defer gogitsync.PutZlibReader(zr)
-
-	mw := io.Discard
-	if !oh.Type.IsDelta() {
-		r.hasher.Reset(oh.Type, oh.Size)
-		mw = r.hasher
-		if r.storage != nil {
-			w, err := r.storage.RawObjectWriter(oh.Type, oh.Size)
-			if err != nil {
-				return nil, err
-			}
-
-			defer func() { _ = w.Close() }()
-			mw = io.MultiWriter(r.hasher, w)
-		}
-	}
-
-	// If low memory mode isn't supported, and either the reader
-	// isn't seekable or this is a delta object, keep the contents
-	// of the objects in memory.
-	if !r.lowMemoryMode && (oh.Type.IsDelta() || r.seeker == nil) {
-		oh.content = gogitsync.GetBytesBuffer()
-		mw = io.MultiWriter(mw, oh.content)
-	}
-
-	// Bind the inflated stream by the size declared in the object header.
-	// A well-formed packfile never produces more inflated bytes than that
-	// value, so any overrun signals a malformed entry. For delta entries
-	// the declared size is the size of the delta instruction stream, not
-	// the resolved object.
-	mw = &boundedWriter{w: mw, limit: oh.Size}
-
-	_, err = ioutil.CopyBufferPool(mw, zr)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := r.Flush(); err != nil {
-		return nil, err
-	}
-
-	oh.Crc32 = r.crc.Sum32()
-	if !oh.Type.IsDelta() {
-		oh.Hash = r.hasher.Sum()
-	}
-
-	r.packData.Section = ObjectSection
-	r.packData.objectHeader = oh
-
-	return nil, nil
+	return &oh, nil
 }
 
 // packFooter parses the packfile checksum.

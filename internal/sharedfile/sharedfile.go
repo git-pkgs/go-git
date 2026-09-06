@@ -75,6 +75,9 @@ func New(open func() (ReadAtCloser, error), gracePeriod time.Duration) *SharedFi
 // the pool evicts or [SharedFile.Close] is called. Pass nil for
 // pool to disable pooling (equivalent to [New]).
 func NewWithPool(open func() (ReadAtCloser, error), gracePeriod time.Duration, pool *fdpool.Pool) *SharedFile {
+	if pool != nil && pool.Stats().Capacity <= 0 {
+		pool = nil
+	}
 	return &SharedFile{open: open, gracePeriod: gracePeriod, pool: pool}
 }
 

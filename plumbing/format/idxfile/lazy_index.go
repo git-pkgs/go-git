@@ -1,11 +1,13 @@
 package idxfile
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"time"
 
 	"github.com/go-git/go-git/v6/internal/sharedfile"
@@ -22,6 +24,7 @@ const (
 	off32Size     = 4
 	off64Size     = 8
 	revHeaderSize = 12 // 4 magic + 4 version + 4 hash function
+	revEntrySize  = 4
 
 	is64bitsMask = uint64(1) << 31
 )
@@ -376,8 +379,8 @@ func (s *LazyIndex) EntriesWithPrefix(prefix []byte) (EntryIter, error) {
 }
 
 // EntriesByOffset returns an iterator over all index entries sorted by
-// their packfile offset. It reads positions from the .rev file on each
-// call to Next, avoiding any up-front allocation or sorting.
+// their packfile offset. Reverse-index positions are buffered in fixed-size
+// chunks, without loading or sorting the full index.
 //
 // The caller must call Close on the returned iterator to release the
 // underlying file references.
@@ -391,7 +394,10 @@ func (s *LazyIndex) EntriesByOffset() (EntryIter, error) {
 		s.idx.Release()
 		return nil, err
 	}
-	return &revEntryIter{s: s, idx: idx, rev: rev}, nil
+	return &revEntryIter{
+		s: s, idx: idx,
+		rev: gsync.GetBufioReader(io.NewSectionReader(rev, revHeaderSize, int64(s.count)*revEntrySize)),
+	}, nil
 }
 
 // Close releases the underlying shared file handles, preventing future
@@ -460,25 +466,28 @@ func (s *LazyIndex) findHashPos(idx io.ReaderAt, h plumbing.Hash) (int, bool, er
 
 // offset returns the pack offset for the object at position pos.
 func (s *LazyIndex) offset(idx io.ReaderAt, pos int) (uint64, error) {
-	var buf [off32Size]byte
+	var buf [off64Size]byte
+	return s.offsetWithBuffer(idx, pos, buf[:])
+}
+
+func (s *LazyIndex) offsetWithBuffer(idx io.ReaderAt, pos int, buf []byte) (uint64, error) {
 	off := int64(s.off32Start + pos*off32Size)
-	if _, err := idx.ReadAt(buf[:], off); err != nil {
+	if _, err := idx.ReadAt(buf[:off32Size], off); err != nil {
 		return 0, fmt.Errorf("%w: cannot read offset32: %v", ErrMalformedIdxFile, err)
 	}
 
-	off32 := binary.BigEndian.Uint32(buf[:])
+	off32 := binary.BigEndian.Uint32(buf[:off32Size])
 	if uint64(off32)&is64bitsMask != 0 {
 		loIndex := int(uint64(off32) & ^is64bitsMask)
 		if loIndex >= s.count64 {
 			return 0, fmt.Errorf("%w: offset64 index %d out of range (have %d entries)",
 				ErrMalformedIdxFile, loIndex, s.count64)
 		}
-		var buf64 [off64Size]byte
 		off64Pos := int64(s.off64Start + loIndex*off64Size)
-		if _, err := idx.ReadAt(buf64[:], off64Pos); err != nil {
+		if _, err := idx.ReadAt(buf[:off64Size], off64Pos); err != nil {
 			return 0, fmt.Errorf("%w: cannot read offset64: %v", ErrMalformedIdxFile, err)
 		}
-		return binary.BigEndian.Uint64(buf64[:]), nil
+		return binary.BigEndian.Uint64(buf[:off64Size]), nil
 	}
 
 	return uint64(off32), nil
@@ -520,45 +529,52 @@ func (s *LazyIndex) count64bitOffsets(idx io.ReaderAt) (int, error) {
 // crc32 returns the CRC32 for the object at position pos.
 func (s *LazyIndex) crc32(idx io.ReaderAt, pos int) (uint32, error) {
 	var buf [4]byte
+	return s.crc32WithBuffer(idx, pos, buf[:])
+}
+
+func (s *LazyIndex) crc32WithBuffer(idx io.ReaderAt, pos int, buf []byte) (uint32, error) {
 	off := int64(s.crcStart + pos*4)
-	if _, err := idx.ReadAt(buf[:], off); err != nil {
+	if _, err := idx.ReadAt(buf[:4], off); err != nil {
 		return 0, fmt.Errorf("%w: cannot read CRC32: %v", ErrMalformedIdxFile, err)
 	}
-	return binary.BigEndian.Uint32(buf[:]), nil
+	return binary.BigEndian.Uint32(buf[:4]), nil
 }
 
 // hashAtPos reads the hash at the given flat position.
 func (s *LazyIndex) hashAtPos(idx io.ReaderAt, pos int) (plumbing.Hash, error) {
 	var arr [32]byte
-	buf := arr[:s.hashSize]
+	return s.hashAtPosWithBuffer(idx, pos, arr[:])
+}
+
+func (s *LazyIndex) hashAtPosWithBuffer(idx io.ReaderAt, pos int, buf []byte) (plumbing.Hash, error) {
 	off := int64(s.namesStart + pos*s.hashSize)
-	if _, err := idx.ReadAt(buf, off); err != nil {
+	if _, err := idx.ReadAt(buf[:s.hashSize], off); err != nil {
 		return plumbing.ZeroHash, fmt.Errorf("read name at pos %d: %w", pos, err)
 	}
 
 	var h plumbing.Hash
 	h.ResetBySize(s.hashSize)
-	_, _ = h.Write(buf)
+	_, _ = h.Write(buf[:s.hashSize])
 	return h, nil
 }
 
 func (s *LazyIndex) findHashViaRev(idx, rev io.ReaderAt, want int64) (plumbing.Hash, error) {
 	lo, hi := 0, s.count
-	var buf [4]byte
+	var buf [32]byte
 
 	for lo < hi {
 		mid := (lo + hi) >> 1
 		revOff := int64(revHeaderSize + mid*4)
-		if _, err := rev.ReadAt(buf[:], revOff); err != nil {
+		if _, err := rev.ReadAt(buf[:4], revOff); err != nil {
 			return plumbing.ZeroHash, fmt.Errorf("read rev entry: %w", err)
 		}
 
-		idxPos := int(binary.BigEndian.Uint32(buf[:]))
+		idxPos := int(binary.BigEndian.Uint32(buf[:4]))
 		if idxPos < 0 || idxPos >= s.count {
 			return plumbing.ZeroHash, fmt.Errorf("%w: rev entry %d out of range (count %d)",
 				ErrMalformedIdxFile, idxPos, s.count)
 		}
-		got, err := s.offset(idx, idxPos)
+		got, err := s.offsetWithBuffer(idx, idxPos, buf[:])
 		if err != nil {
 			return plumbing.ZeroHash, err
 		}
@@ -569,7 +585,7 @@ func (s *LazyIndex) findHashViaRev(idx, rev io.ReaderAt, want int64) (plumbing.H
 		case int64(got) > want:
 			hi = mid
 		default:
-			return s.hashAtPos(idx, idxPos)
+			return s.hashAtPosWithBuffer(idx, idxPos, buf[:])
 		}
 	}
 	return plumbing.ZeroHash, plumbing.ErrObjectNotFound
@@ -630,49 +646,108 @@ func (it *scannerEntryIter) Close() error {
 // walking the .rev file sequentially. It holds acquired references to
 // both the idx and rev sharedFiles, released on Close.
 type revEntryIter struct {
-	s   *LazyIndex
-	idx io.ReaderAt
-	rev io.ReaderAt
-	pos int
+	s          *LazyIndex
+	idx        io.ReaderAt
+	rev        *bufio.Reader
+	pos        int
+	batch      []Entry
+	order      []int
+	positions  []int
+	next       int
+	readBuffer *indexReadBuffer
+	scratch    [32]byte
+	err        error
 }
 
 func (it *revEntryIter) Next() (*Entry, error) {
 	if it.idx == nil || it.rev == nil {
 		return nil, sharedfile.ErrClosed
 	}
+	if it.err != nil {
+		return nil, it.err
+	}
 	if it.pos >= it.s.count {
 		return nil, io.EOF
 	}
 
-	var buf [4]byte
-	revOff := int64(revHeaderSize + it.pos*4)
-	if _, err := it.rev.ReadAt(buf[:], revOff); err != nil {
-		return nil, fmt.Errorf("read rev entry at %d: %w", it.pos, err)
+	if it.next == len(it.batch) {
+		if err := it.fill(); err != nil {
+			it.err = err
+			return nil, err
+		}
 	}
-
-	idxPos := int(binary.BigEndian.Uint32(buf[:]))
-	if idxPos < 0 || idxPos >= it.s.count {
-		return nil, fmt.Errorf("%w: rev entry %d out of range (count %d)",
-			ErrMalformedIdxFile, idxPos, it.s.count)
-	}
-
-	e, err := it.s.entryAt(it.idx, idxPos)
-	if err != nil {
-		return nil, err
-	}
-
+	e := it.batch[it.next]
+	it.next++
 	it.pos++
-	return e, nil
+	return &e, nil
+}
+
+func (it *revEntryIter) fill() error {
+	const batchSize = 1024
+	count := min(batchSize, it.s.count-it.pos)
+	if it.batch == nil {
+		it.batch = make([]Entry, count)
+		it.order = make([]int, count)
+		it.positions = make([]int, count)
+		it.readBuffer = &indexReadBuffer{source: it.idx}
+	}
+	it.batch = it.batch[:count]
+	it.order = it.order[:count]
+	it.positions = it.positions[:count]
+	it.next = 0
+
+	var buf [4]byte
+	positions := it.positions
+	for i := range count {
+		if _, err := io.ReadFull(it.rev, buf[:]); err != nil {
+			return fmt.Errorf("read rev entry at %d: %w", it.pos+i, err)
+		}
+		pos := int(binary.BigEndian.Uint32(buf[:]))
+		if pos < 0 || pos >= it.s.count {
+			return fmt.Errorf("%w: rev entry %d out of range (count %d)", ErrMalformedIdxFile, pos, it.s.count)
+		}
+		positions[i] = pos
+		it.order[i] = i
+	}
+	slices.SortFunc(it.order, func(a, b int) int { return positions[a] - positions[b] })
+	for _, i := range it.order {
+		h, err := it.s.hashAtPosWithBuffer(it.readBuffer, positions[i], it.scratch[:])
+		if err != nil {
+			return err
+		}
+		it.batch[i].Hash = h
+	}
+	for _, i := range it.order {
+		crc, err := it.s.crc32WithBuffer(it.readBuffer, positions[i], it.scratch[:])
+		if err != nil {
+			return err
+		}
+		it.batch[i].CRC32 = crc
+	}
+	for _, i := range it.order {
+		off, err := it.s.offsetWithBuffer(it.readBuffer, positions[i], it.scratch[:])
+		if err != nil {
+			return err
+		}
+		it.batch[i].Offset = off
+	}
+	return nil
 }
 
 func (it *revEntryIter) Close() error {
 	it.pos = it.s.count
+	it.batch = nil
+	it.order = nil
+	it.positions = nil
+	it.readBuffer = nil
 	if it.idx != nil {
 		it.s.idx.Release()
 		it.idx = nil
 	}
 	if it.rev != nil {
 		it.s.rev.Release()
+		it.rev.Reset(nil)
+		gsync.PutBufioReader(it.rev)
 		it.rev = nil
 	}
 	return nil

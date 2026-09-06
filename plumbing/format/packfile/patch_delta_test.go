@@ -180,6 +180,23 @@ func TestReaderFromDeltaRejectsOversizedCopies(t *testing.T) {
 		"ReaderFromDelta yielded more bytes than the declared target size")
 }
 
+func TestReaderFromDeltaTracksPositionAfterRewind(t *testing.T) {
+	base := &plumbing.MemoryObject{}
+	_, err := base.Write([]byte("abcdefghijklmnopqrstuvwxyz"))
+	require.NoError(t, err)
+	delta := buildDelta(26, 9,
+		encodeCopyOperation(10, 3),
+		encodeCopyOperation(2, 3),
+		encodeCopyOperation(20, 3),
+	)
+	reader, err := ReaderFromDelta(base, bytes.NewReader(delta))
+	require.NoError(t, err)
+	defer reader.Close()
+	got, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	assert.Equal(t, "klmcdeuvw", string(got))
+}
+
 // TestPatchDeltaRejectsTrailingBytes asserts that a delta whose
 // operations exactly fill the declared target size but is followed by
 // extra bytes is rejected, matching upstream's `data != top` post-loop

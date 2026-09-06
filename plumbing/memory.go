@@ -79,6 +79,20 @@ func (o *MemoryObject) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
+// WriteTo writes the object's content to w.
+func (o *MemoryObject) WriteTo(w io.Writer) (int64, error) {
+	n, err := w.Write(o.cont)
+	if err == nil && n != len(o.cont) {
+		err = io.ErrShortWrite
+	}
+	return int64(n), err
+}
+
+// Bytes returns the object's content. The returned slice must not be modified.
+func (o *MemoryObject) Bytes() []byte {
+	return o.cont
+}
+
 // Close releases any resources consumed by the object when it is acting as a
 // ObjectWriter.
 func (o *MemoryObject) Close() error { return nil }

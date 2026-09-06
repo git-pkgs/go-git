@@ -1006,6 +1006,102 @@ func (s *ObjectStorage) IterEncodedObjects(t plumbing.ObjectType) (storer.Encode
 	return storer.NewMultiEncodedObjectIter(iters), nil
 }
 
+// IterObjectInfos returns metadata for all encoded objects with the given type.
+// Packed delta objects are classified and sized without reconstructing them.
+func (s *ObjectStorage) IterObjectInfos(t plumbing.ObjectType) (ObjectInfoIter, error) {
+	objects, err := s.dir.Objects()
+	if err != nil {
+		return nil, err
+	}
+
+	seen := make(map[plumbing.Hash]struct{})
+	var iters []ObjectInfoIter
+	if len(objects) != 0 {
+		iters = append(iters, &looseObjectInfoIter{s: s, typ: t, hashes: objects})
+		seen = hashListAsMap(objects)
+	}
+
+	packIter, err := s.buildPackfileInfoIter(t, seen)
+	if err != nil {
+		return nil, err
+	}
+	iters = append(iters, packIter)
+	return &multiObjectInfoIter{iters: iters}, nil
+}
+
+func (s *ObjectStorage) buildPackfileInfoIter(
+	typ plumbing.ObjectType,
+	seen map[plumbing.Hash]struct{},
+) (ObjectInfoIter, error) {
+	if err := s.requireIndex(); err != nil {
+		return nil, err
+	}
+
+	packs, err := s.dir.ObjectPacks()
+	if err != nil {
+		return nil, err
+	}
+	return &lazyPackfileInfoIter{
+		hashes: packs,
+		open: func(h plumbing.Hash) (ObjectInfoIter, error) {
+			s.muI.RLock()
+			idx := s.index[h]
+			s.muI.RUnlock()
+			pack, err := s.packfile(idx, h)
+			if err != nil {
+				return nil, err
+			}
+			iter, err := pack.GetObjectInfosByType(typ)
+			if err != nil {
+				_ = pack.Close()
+				return nil, err
+			}
+			return &packfileObjectInfoIter{pack: pack, packHash: h, iter: iter, seen: seen}, nil
+		},
+	}, nil
+}
+
+// EncodedObjectFromInfo loads an object previously returned by IterObjectInfos.
+func (s *ObjectStorage) EncodedObjectFromInfo(info ObjectInfo) (plumbing.EncodedObject, error) {
+	if info.object != nil {
+		return info.object, nil
+	}
+	if !info.packed {
+		obj, err := s.getFromUnpacked(info.Hash)
+		if err != nil {
+			return nil, err
+		}
+		if obj.Type() != info.Type {
+			return nil, plumbing.ErrObjectNotFound
+		}
+		return obj, nil
+	}
+
+	if cached, ok := s.objectCache.Get(info.Hash); ok {
+		if cached.Type() != info.Type {
+			return nil, plumbing.ErrObjectNotFound
+		}
+		return cached, nil
+	}
+	if err := s.requireIndex(); err != nil {
+		return nil, err
+	}
+	s.muI.RLock()
+	idx := s.index[info.packHash]
+	s.muI.RUnlock()
+	if idx == nil {
+		return nil, plumbing.ErrObjectNotFound
+	}
+	obj, err := s.getFromPackfileAt(info.packHash, idx, info.Hash, info.offset, false)
+	if err != nil {
+		return nil, err
+	}
+	if obj.Type() != info.Type {
+		return nil, plumbing.ErrObjectNotFound
+	}
+	return obj, nil
+}
+
 func (s *ObjectStorage) buildPackfileIters(
 	t plumbing.ObjectType,
 	seen map[plumbing.Hash]struct{},
@@ -1021,17 +1117,19 @@ func (s *ObjectStorage) buildPackfileIters(
 	return &lazyPackfilesIter{
 		hashes: packs,
 		open: func(h plumbing.Hash) (storer.EncodedObjectIter, error) {
-			pack, err := s.dir.OpenPackForReading(h)
-			if err != nil {
-				return nil, err
-			}
 			s.muI.RLock()
 			idx := s.index[h]
 			s.muI.RUnlock()
-			return newPackfileIter(
-				s.dir.Fs(), pack, t, seen, idx,
-				s.objectCache, false, h.Size(),
-			)
+			pack, err := s.packfile(idx, h)
+			if err != nil {
+				return nil, err
+			}
+			iter, err := pack.GetByType(t)
+			if err != nil {
+				_ = pack.Close()
+				return nil, err
+			}
+			return &packfileIter{pack: pack, iter: iter, seen: seen}, nil
 		},
 	}, nil
 }

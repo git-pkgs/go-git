@@ -112,7 +112,7 @@ func (s ObjectID) String() string {
 // Write writes the hexadecimal representation of the ObjectID from [in]
 // directly into the current object.
 func (s *ObjectID) Write(in []byte) (int, error) {
-	n := copy(s.hash[:], in)
+	n := copy(s.hash[:s.Size()], in)
 	return n, nil
 }
 

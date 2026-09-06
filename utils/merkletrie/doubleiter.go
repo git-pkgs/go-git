@@ -138,8 +138,6 @@ const (
 // Compare returns the comparison between the current elements in the
 // merkletries.
 func (d *doubleIter) compare() (s comparison, err error) {
-	s.sameHash = d.hashEqual(d.from.current, d.to.current)
-
 	fromIsDir := d.from.current.IsDir()
 	toIsDir := d.to.current.IsDir()
 
@@ -169,8 +167,6 @@ type comparison struct {
 	// the following are only valid if both nodes have the same name
 	// (i.e. nameComparison == 0)
 
-	// Do both nodes have the same hash?
-	sameHash bool
 	// Are both nodes files?
 	bothAreFiles bool
 

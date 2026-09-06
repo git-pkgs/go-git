@@ -200,6 +200,55 @@ func TestDecodeByType(t *testing.T) {
 	})
 }
 
+func TestObjectInfosByType(t *testing.T) {
+	t.Parallel()
+
+	for _, typ := range []plumbing.ObjectType{
+		plumbing.AnyObject,
+		plumbing.CommitObject,
+		plumbing.TagObject,
+		plumbing.TreeObject,
+		plumbing.BlobObject,
+	} {
+		typ := typ
+		packs := fixtures.ByTag("packfile")
+		packs.Run(t, func(t *testing.T, f *fixtures.Fixture) {
+			t.Parallel()
+
+			p := newPackfile(t, f)
+			defer p.Close()
+			expectedCount, err := p.Count()
+			require.NoError(t, err)
+			iter, err := p.GetObjectInfosByType(typ)
+			require.NoError(t, err)
+			defer iter.Close()
+
+			var count int
+			err = iter.ForEach(func(info packfile.ObjectInfo) error {
+				fromInfo, err := p.GetByInfo(info)
+				require.NoError(t, err)
+				assert.Equal(t, info.Hash, fromInfo.Hash())
+				assert.Equal(t, info.Type, fromInfo.Type())
+				assert.Equal(t, info.Size, fromInfo.Size())
+
+				obj, err := p.Get(info.Hash)
+				require.NoError(t, err)
+				assert.Equal(t, obj.Type(), info.Type)
+				assert.Equal(t, obj.Size(), info.Size)
+				if typ != plumbing.AnyObject {
+					assert.Equal(t, typ, info.Type)
+				}
+				count++
+				return nil
+			})
+			require.NoError(t, err)
+			if typ == plumbing.AnyObject {
+				assert.Equal(t, int(expectedCount), count)
+			}
+		})
+	}
+}
+
 func TestDecodeByTypeConstructor(t *testing.T) {
 	t.Parallel()
 
@@ -219,6 +268,9 @@ func TestDecodeByTypeConstructor(t *testing.T) {
 		assert.ErrorIs(t, err, plumbing.ErrInvalidType)
 
 		_, err = p.GetByType(plumbing.InvalidObject)
+		assert.ErrorIs(t, err, plumbing.ErrInvalidType)
+
+		_, err = p.GetObjectInfosByType(plumbing.OFSDeltaObject)
 		assert.ErrorIs(t, err, plumbing.ErrInvalidType)
 	})
 }

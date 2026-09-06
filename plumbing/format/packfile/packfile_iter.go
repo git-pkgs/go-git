@@ -8,9 +8,10 @@ import (
 )
 
 type objectIter struct {
-	p    *Packfile
-	typ  plumbing.ObjectType
-	iter idxfile.EntryIter
+	p     *Packfile
+	typ   plumbing.ObjectType
+	iter  idxfile.EntryIter
+	types *objectTypeCache
 }
 
 func (i *objectIter) Next() (plumbing.EncodedObject, error) {
@@ -31,7 +32,17 @@ func (i *objectIter) next() (plumbing.EncodedObject, error) {
 			return nil, err
 		}
 
-		oh, err := i.p.headerFromOffset(int64(e.Offset))
+		if o, ok := i.p.cache.Get(e.Hash); ok {
+			if i.types != nil {
+				i.types.put(int64(e.Offset), o.Type())
+			}
+			if i.typ == plumbing.AnyObject || o.Type() == i.typ {
+				return o, nil
+			}
+			continue
+		}
+
+		oh, err := i.p.headerFromOffset(int64(e.Offset), e.Hash)
 		if err != nil {
 			return nil, err
 		}
@@ -40,21 +51,13 @@ func (i *objectIter) next() (plumbing.EncodedObject, error) {
 			return i.p.objectFromHeader(oh)
 		}
 
-		// Current object header type is a delta, get the actual object to
-		// assess the actual type.
-		if oh.Type.IsDelta() {
-			o, err := i.p.objectFromHeader(oh)
-			if err != nil {
-				return nil, err
-			}
-			if o.Type() == i.typ {
-				return o, nil
-			}
-
-			continue
+		typ, err := i.objectType(oh)
+		if err != nil {
+			return nil, err
 		}
+		i.types.put(int64(e.Offset), typ)
 
-		if oh.Type == i.typ {
+		if typ == i.typ {
 			return i.p.objectFromHeader(oh)
 		}
 
@@ -90,4 +93,5 @@ func (i *objectIter) Close() {
 	defer i.p.m.Unlock()
 
 	_ = i.iter.Close()
+	i.types = nil
 }

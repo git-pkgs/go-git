@@ -111,6 +111,29 @@ func TestIndexSuite(t *testing.T) {
 	suite.Run(t, new(IndexSuite))
 }
 
+func TestMemoryIndexHashesAreCanonical(t *testing.T) {
+	t.Parallel()
+	idx, err := fixtureIndex()
+	require.NoError(t, err)
+	defer func() { _ = idx.Close() }()
+	iter, err := idx.Entries()
+	require.NoError(t, err)
+	defer func() { _ = iter.Close() }()
+	for {
+		entry, err := iter.Next()
+		if err == io.EOF {
+			break
+		}
+		require.NoError(t, err)
+		canonical, ok := plumbing.FromHex(entry.Hash.String())
+		require.True(t, ok)
+		assert.Equal(t, canonical, entry.Hash)
+		reverse, err := idx.FindHash(int64(entry.Offset))
+		require.NoError(t, err)
+		assert.Equal(t, canonical, reverse)
+	}
+}
+
 func (s *IndexSuite) TestMayContain() {
 	idx, err := fixtureIndex()
 	s.NoError(err)

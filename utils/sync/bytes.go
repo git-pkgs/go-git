@@ -28,13 +28,12 @@ var (
 // by calling PutByteSlice.
 func GetByteSlice() *[]byte {
 	buf := byteSlice.Get().(*[]byte)
-	b := *buf
-	if len(b) < size {
-		b = b[:cap(b)]
+	if len(*buf) < size {
+		*buf = (*buf)[:cap(*buf)]
 	}
 
-	clear(b)
-	return &b
+	clear(*buf)
+	return buf
 }
 
 // PutByteSlice puts buf back into its sync.Pool.

@@ -1,6 +1,7 @@
 package plumbing
 
 import (
+	"bytes"
 	"io"
 	"testing"
 
@@ -101,4 +102,33 @@ func (s *MemoryObjectSuite) TestWriter() {
 	s.Equal(3, n)
 
 	s.Equal([]byte("foo"), o.cont)
+}
+
+func (s *MemoryObjectSuite) TestWriteTo() {
+	o := &MemoryObject{cont: []byte("foo")}
+	var destination bytes.Buffer
+
+	n, err := o.WriteTo(&destination)
+	s.NoError(err)
+	s.Equal(int64(3), n)
+	s.Equal("foo", destination.String())
+}
+
+func (s *MemoryObjectSuite) TestWriteToRejectsShortWrite() {
+	o := &MemoryObject{cont: []byte("foo")}
+
+	n, err := o.WriteTo(shortMemoryObjectWriter{})
+	s.ErrorIs(err, io.ErrShortWrite)
+	s.Equal(int64(2), n)
+}
+
+func (s *MemoryObjectSuite) TestBytes() {
+	o := &MemoryObject{cont: []byte("foo")}
+	s.Equal([]byte("foo"), o.Bytes())
+}
+
+type shortMemoryObjectWriter struct{}
+
+func (shortMemoryObjectWriter) Write(p []byte) (int, error) {
+	return len(p) - 1, nil
 }

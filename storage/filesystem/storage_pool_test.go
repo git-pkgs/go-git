@@ -41,8 +41,8 @@ func TestStorage_FDPool_PoolIsUsed(t *testing.T) {
 	_, err = s.EncodedObject(plumbing.AnyObject, obj.Hash())
 	require.NoError(t, err)
 
-	assert.Greater(t, pool.Stats().Active, 0,
-		"after a read, pool should have active SharedFiles")
+	assert.GreaterOrEqual(t, pool.Stats().Active, 2,
+		"after a read, pool should track the pack and index")
 }
 
 // TestStorage_FDPool_AlternatesShareParentPool verifies that when a

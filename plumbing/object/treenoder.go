@@ -1,7 +1,7 @@
 package object
 
 import (
-	"io"
+	"encoding/binary"
 
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/filemode"
@@ -23,6 +23,8 @@ type treeNoder struct {
 	hash     plumbing.Hash
 	children []noder.Noder // memoized
 }
+
+const encodedFileModeSize = 4
 
 // NewTreeRootNode returns the root node of a Tree
 func NewTreeRootNode(t *Tree) noder.Noder {
@@ -51,10 +53,15 @@ func (t *treeNoder) String() string {
 }
 
 func (t *treeNoder) Hash() []byte {
-	if t.mode == filemode.Deprecated {
-		return append(t.hash.Bytes(), filemode.Regular.Bytes()...)
+	mode := t.mode
+	if mode == filemode.Deprecated {
+		mode = filemode.Regular
 	}
-	return append(t.hash.Bytes(), t.mode.Bytes()...)
+	size := t.hash.Size()
+	combined := make([]byte, size+encodedFileModeSize)
+	copy(combined, t.hash.Bytes())
+	binary.LittleEndian.PutUint32(combined[size:], uint32(mode))
+	return combined
 }
 
 func (t *treeNoder) Name() string {
@@ -83,61 +90,30 @@ func (t *treeNoder) Children() ([]noder.Noder, error) {
 	parent := t.parent
 	if !t.isRoot() {
 		var err error
-		if parent, err = t.parent.Tree(t.name); err != nil {
+		if parent, err = GetTree(t.parent.s, t.hash); err != nil {
 			return nil, err
 		}
 	}
 
-	var err error
-	t.children, err = transformChildren(parent)
-	return t.children, err
+	t.children = transformChildren(parent)
+	return t.children, nil
 }
 
 // Returns the children of a tree as treenoders.
 // Efficiency is key here.
-func transformChildren(t *Tree) ([]noder.Noder, error) {
-	var err error
-	var e TreeEntry
-
-	// there will be more tree entries than children in the tree,
-	// due to submodules and empty directories, but I think it is still
-	// worth it to pre-allocate the whole array now, even if sometimes
-	// is bigger than needed.
-	ret := make([]noder.Noder, 0, len(t.Entries))
-
-	walker := NewTreeWalker(t, false, nil) // don't recurse
-	// The diff walk is read-only and never materialises entry names into the
-	// filesystem, so it must enumerate the tree faithfully — including entries
-	// with names that are unsafe to check out but valid per upstream Git (e.g.
-	// control characters). Path safety is enforced at materialisation
-	// boundaries (FindEntry, TreeEntryFile, archive, FileIter), not here.
-	walker.skipPathValidation = true
-	// don't defer walker.Close() for efficiency reasons.
-	for {
-		_, e, err = walker.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			walker.Close()
-			return nil, err
-		}
-
-		ret = append(ret, &treeNoder{
+func transformChildren(t *Tree) []noder.Noder {
+	ret := make([]noder.Noder, len(t.Entries))
+	for i, e := range t.Entries {
+		ret[i] = &treeNoder{
 			parent: t,
 			name:   e.Name,
 			mode:   e.Mode,
 			hash:   e.Hash,
-		})
+		}
 	}
-	walker.Close()
-
-	return ret, nil
+	return ret
 }
 
-// len(t.tree.Entries) != the number of elements walked by treewalker
-// for some reason because of empty directories, submodules, etc, so we
-// have to walk here.
 func (t *treeNoder) NumChildren() (int, error) {
 	children, err := t.Children()
 	if err != nil {

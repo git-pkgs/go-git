@@ -29,7 +29,7 @@ var (
 const (
 	// maxPatchPreemptionSize defines what is the max size of bytes to be
 	// preemptively made available for a patch operation.
-	maxPatchPreemptionSize uint = 65536
+	maxPatchPreemptionSize uint = 64 << 10
 
 	// minDeltaSize is the smallest valid delta: a 1-byte srcSz LEB128
 	// header followed by a 1-byte targetSz LEB128 header (the
@@ -182,6 +182,7 @@ func ReaderFromDelta(base plumbing.EncodedObject, deltaRC io.Reader) (io.ReadClo
 						return
 					}
 					baseBuf.Reset(baseRd)
+					basePos = 0
 					discard = offset
 				}
 				for discard > math.MaxInt32 {

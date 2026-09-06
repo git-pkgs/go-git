@@ -158,6 +158,25 @@ func TestSharedFile_NoPool_ImmediateClose(t *testing.T) {
 	sf.Release()
 }
 
+func TestSharedFile_NoOpPoolUsesGracePeriod(t *testing.T) {
+	t.Parallel()
+	open, opens, handles := newOpener(t, []byte("disabled"))
+	sf := NewWithPool(open, 5*time.Millisecond, fdpool.New(0))
+	defer sf.Close()
+
+	_, err := sf.Acquire()
+	require.NoError(t, err)
+	sf.Release()
+	assert.Eventually(t, func() bool {
+		return len(*handles) > 0 && (*handles)[0].closed.Load()
+	}, time.Second, 5*time.Millisecond)
+
+	_, err = sf.Acquire()
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), opens.Load())
+	sf.Release()
+}
+
 // TestSharedFile_Pool_ReadsDuringEviction stresses the refcount +
 // immediateClose latch contract under sustained concurrent I/O.
 // N reader goroutines do Acquire → ReadAt → verify bytes → Release

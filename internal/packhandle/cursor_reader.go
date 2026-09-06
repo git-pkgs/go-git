@@ -34,6 +34,14 @@ type cursorReader struct {
 	closed atomic.Bool
 }
 
+type viewReaderAt interface {
+	ViewAt(int64, int, func([]byte) error) (int, error)
+}
+
+type viewReaderFrom interface {
+	ViewFrom(int64, func([]byte) error) error
+}
+
 func newCursorReader(sf *sharedfile.SharedFile, size int64) (*cursorReader, error) {
 	f, err := sf.Acquire()
 	if err != nil {
@@ -62,6 +70,28 @@ func (c *cursorReader) ReadAt(p []byte, off int64) (int, error) {
 		return 0, fs.ErrClosed
 	}
 	return c.file.ReadAt(p, off)
+}
+
+func (c *cursorReader) ViewAt(off int64, size int, visit func([]byte) error) (int, error) {
+	if c.closed.Load() || c.sf.IsClosed() {
+		return 0, fs.ErrClosed
+	}
+	viewer, ok := c.file.(viewReaderAt)
+	if !ok {
+		return 0, errors.ErrUnsupported
+	}
+	return viewer.ViewAt(off, size, visit)
+}
+
+func (c *cursorReader) ViewFrom(off int64, visit func([]byte) error) error {
+	if c.closed.Load() || c.sf.IsClosed() {
+		return fs.ErrClosed
+	}
+	viewer, ok := c.file.(viewReaderFrom)
+	if !ok {
+		return errors.ErrUnsupported
+	}
+	return viewer.ViewFrom(off, visit)
 }
 
 func (c *cursorReader) Seek(offset int64, whence int) (int64, error) {

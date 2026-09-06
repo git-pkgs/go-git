@@ -3,7 +3,9 @@ package cache
 import (
 	"fmt"
 	"io"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
@@ -36,6 +38,7 @@ func (s *ObjectSuite) SetupTest() {
 	s.c = make(map[string]Object)
 	s.c["two_bytes"] = NewObjectLRU(2 * Byte)
 	s.c["default_lru"] = NewObjectLRUDefault()
+	s.c["sharded_two_bytes"] = NewShardedObjectLRU(2*Byte, 2)
 }
 
 func (s *ObjectSuite) TestPutSameObject() {
@@ -45,6 +48,75 @@ func (s *ObjectSuite) TestPutSameObject() {
 		_, ok := o.Get(s.aObject.Hash())
 		s.True(ok)
 	}
+}
+
+func (s *ObjectSuite) TestPutWithHashDoesNotComputeHash() {
+	cache := NewObjectLRU(2 * Byte)
+	want := plumbing.NewHash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	object := &countingObject{size: 1}
+	cache.PutWithHash(want, object)
+	got, ok := cache.Get(want)
+	s.True(ok)
+	s.Same(object, got)
+	cache.PutWithHash(plumbing.NewHash("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"), &countingObject{size: 2})
+	s.Zero(object.hashCalls)
+}
+
+func (s *ObjectSuite) TestPutWithHashSupportsObjectFormats() {
+	cache := NewObjectLRU(2 * Byte)
+	sha1 := plumbing.NewHash(strings.Repeat("a", 40))
+	sha256 := plumbing.NewHash(strings.Repeat("a", 64))
+	sha1Object := &countingObject{size: 1}
+	sha256Object := &countingObject{size: 1}
+
+	cache.PutWithHash(sha1, sha1Object)
+	cache.PutWithHash(sha256, sha256Object)
+
+	got, ok := cache.Get(sha1)
+	s.True(ok)
+	s.Same(sha1Object, got)
+	got, ok = cache.Get(sha256)
+	s.True(ok)
+	s.Same(sha256Object, got)
+}
+
+func (s *ObjectSuite) TestShardedPutGetAndClear() {
+	cache := NewShardedObjectLRU(4*Byte, 2)
+	first := newObject("00aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 2*Byte)
+	second := newObject("01bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 2*Byte)
+	cache.Put(first)
+	cache.Put(second)
+	got, ok := cache.Get(first.Hash())
+	s.True(ok)
+	s.Same(first, got)
+	got, ok = cache.Get(second.Hash())
+	s.True(ok)
+	s.Same(second, got)
+
+	cache.Clear()
+	_, ok = cache.Get(first.Hash())
+	s.False(ok)
+	_, ok = cache.Get(second.Hash())
+	s.False(ok)
+}
+
+func (s *ObjectSuite) TestShardedPutWithHashDoesNotComputeHash() {
+	cache := NewShardedObjectLRU(2*Byte, 2)
+	want := plumbing.NewHash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	object := &countingObject{size: 1}
+	cache.PutWithHash(want, object)
+	got, ok := cache.Get(want)
+	s.True(ok)
+	s.Same(object, got)
+	s.Zero(object.hashCalls)
+}
+
+func (s *ObjectSuite) TestShardedRejectsObjectLargerThanShard() {
+	cache := NewShardedObjectLRU(4*Byte, 2)
+	object := newObject("00aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 3*Byte)
+	cache.Put(object)
+	_, ok := cache.Get(object.Hash())
+	s.False(ok)
 }
 
 func (s *ObjectSuite) TestPutSameObjectWithDifferentSize() {
@@ -111,6 +183,23 @@ func (s *ObjectSuite) TestEvictMultipleObjects() {
 	s.NotNil(obj)
 }
 
+func (s *ObjectSuite) TestGetUpdatesRecency() {
+	cache := NewObjectLRU(2 * Byte)
+	cache.Put(s.aObject)
+	cache.Put(s.cObject)
+
+	_, ok := cache.Get(s.aObject.Hash())
+	s.True(ok)
+	cache.Put(s.dObject)
+
+	_, ok = cache.Get(s.aObject.Hash())
+	s.True(ok)
+	_, ok = cache.Get(s.cObject.Hash())
+	s.False(ok)
+	_, ok = cache.Get(s.dObject.Hash())
+	s.True(ok)
+}
+
 func (s *ObjectSuite) TestClear() {
 	for _, o := range s.c {
 		o.Put(s.aObject)
@@ -168,10 +257,59 @@ func (s *ObjectSuite) TestObjectUpdateOverflow() {
 	o.Put(b)
 }
 
+func BenchmarkObjectLRUParallelGet(b *testing.B) {
+	const objectCount = 4096
+	objects := make([]plumbing.EncodedObject, objectCount)
+	for i := range objects {
+		objects[i] = newObject(fmt.Sprintf("%02x%038x", i%256, i+1), 1*Byte)
+	}
+	for _, setup := range []struct {
+		name  string
+		cache Object
+	}{
+		{name: "single", cache: NewObjectLRU(objectCount * Byte)},
+		{name: "sharded-8", cache: NewShardedObjectLRU(objectCount*Byte, 8)},
+	} {
+		b.Run(setup.name, func(b *testing.B) {
+			for _, object := range objects {
+				setup.cache.Put(object)
+			}
+			var seed atomic.Uint64
+			b.ReportAllocs()
+			b.RunParallel(func(pb *testing.PB) {
+				next := seed.Add(1)
+				for pb.Next() {
+					object := objects[next%objectCount]
+					if _, ok := setup.cache.Get(object.Hash()); !ok {
+						b.Fatal("object was evicted")
+					}
+					next++
+				}
+			})
+		})
+	}
+}
+
 type dummyObject struct {
 	hash plumbing.Hash
 	size FileSize
 }
+
+type countingObject struct {
+	hashCalls int
+	size      int64
+}
+
+func (o *countingObject) Hash() plumbing.Hash {
+	o.hashCalls++
+	return plumbing.ZeroHash
+}
+func (*countingObject) Type() plumbing.ObjectType       { return plumbing.InvalidObject }
+func (*countingObject) SetType(plumbing.ObjectType)     {}
+func (o *countingObject) Size() int64                   { return o.size }
+func (o *countingObject) SetSize(size int64)            { o.size = size }
+func (*countingObject) Reader() (io.ReadCloser, error)  { return nil, nil }
+func (*countingObject) Writer() (io.WriteCloser, error) { return nil, nil }
 
 func newObject(hash string, size FileSize) plumbing.EncodedObject {
 	return &dummyObject{

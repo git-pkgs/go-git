@@ -2,10 +2,13 @@ package packfile
 
 import (
 	"bufio"
+	"bytes"
 	"crypto"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"sync"
 	"sync/atomic"
 
@@ -15,7 +18,9 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/cache"
 	format "github.com/go-git/go-git/v6/plumbing/format/config"
 	"github.com/go-git/go-git/v6/plumbing/format/idxfile"
+	packutil "github.com/go-git/go-git/v6/plumbing/format/packfile/util"
 	"github.com/go-git/go-git/v6/plumbing/storer"
+	"github.com/go-git/go-git/v6/utils/binary"
 	"github.com/go-git/go-git/v6/utils/ioutil"
 	gogitsync "github.com/go-git/go-git/v6/utils/sync"
 )
@@ -28,6 +33,20 @@ var (
 	// the packfile contents.
 	ErrZLib = NewError("zlib reading error")
 )
+
+const objectHeaderViewSize = 64
+
+type viewReaderAt interface {
+	ViewAt(int64, int, func([]byte) error) (int, error)
+}
+
+type viewReaderFrom interface {
+	ViewFrom(int64, func([]byte) error) error
+}
+
+type knownHashObjectCache interface {
+	PutWithHash(plumbing.Hash, plumbing.EncodedObject)
+}
 
 // Packfile allows retrieving information from inside a packfile.
 type Packfile struct {
@@ -45,6 +64,7 @@ type Packfile struct {
 
 	cache cache.Object
 	rbuf  *bufio.Reader
+	view  bytes.Reader
 
 	id           plumbing.Hash
 	m            sync.Mutex
@@ -59,6 +79,7 @@ type Packfile struct {
 // NewPackfile returns a packfile representation for the given .pack
 // file and idx. If [WithFs] is set the packfile returns [FSObject]s;
 // otherwise it returns [plumbing.MemoryObject]s.
+// Non-delta FSObject payloads are decoded and validated by Reader.
 //
 // When [WithPackHandle] is supplied, the resolver owns the pack
 // file descriptor and the file argument is redundant; the
@@ -124,6 +145,41 @@ func (p *Packfile) GetByOffset(offset int64) (plumbing.EncodedObject, error) {
 	return p.getByOffset(offset)
 }
 
+// GetByInfo retrieves an object described by GetObjectInfosByType.
+func (p *Packfile) GetByInfo(info ObjectInfo) (plumbing.EncodedObject, error) {
+	if p.closed.Load() {
+		return nil, fs.ErrClosed
+	}
+	if err := p.init(); err != nil {
+		return nil, err
+	}
+	p.m.Lock()
+	defer p.m.Unlock()
+	if p.closed.Load() {
+		return nil, fs.ErrClosed
+	}
+	if !p.id.Equal(info.pack) {
+		return nil, plumbing.ErrObjectNotFound
+	}
+	if info.object != nil {
+		return info.object, nil
+	}
+	if info.header == nil {
+		return nil, plumbing.ErrObjectNotFound
+	}
+	if obj, ok := p.cache.Get(info.Hash); ok {
+		return obj, nil
+	}
+	obj, err := p.objectFromHeader(info.header)
+	if err != nil {
+		return nil, err
+	}
+	if obj.Type() != info.Type || obj.Size() != info.Size {
+		return nil, plumbing.ErrObjectNotFound
+	}
+	return obj, nil
+}
+
 // GetSizeByOffset retrieves the size of the encoded object from the
 // packfile with the given offset.
 func (p *Packfile) GetSizeByOffset(offset int64) (size int64, err error) {
@@ -169,10 +225,45 @@ func (p *Packfile) GetByType(typ plumbing.ObjectType) (storer.EncodedObjectIter,
 			return nil, err
 		}
 
-		return &objectIter{
+		iter := &objectIter{
 			p:    p,
 			iter: entries,
 			typ:  typ,
+		}
+		if typ != plumbing.AnyObject {
+			iter.types = &objectTypeCache{}
+		}
+		return iter, nil
+	default:
+		return nil, plumbing.ErrInvalidType
+	}
+}
+
+// GetObjectInfosByType returns metadata for all objects of the given type.
+// Delta objects are classified and sized without reconstructing their bases.
+func (p *Packfile) GetObjectInfosByType(typ plumbing.ObjectType) (ObjectInfoIter, error) {
+	if p.closed.Load() {
+		return nil, fs.ErrClosed
+	}
+	if err := p.init(); err != nil {
+		return nil, err
+	}
+
+	switch typ {
+	case plumbing.AnyObject,
+		plumbing.BlobObject,
+		plumbing.TreeObject,
+		plumbing.CommitObject,
+		plumbing.TagObject:
+		entries, err := p.EntriesByOffset()
+		if err != nil {
+			return nil, err
+		}
+		return &objectInfoIter{
+			p:     p,
+			iter:  entries,
+			typ:   typ,
+			types: &objectTypeCache{},
 		}, nil
 	default:
 		return nil, plumbing.ErrInvalidType
@@ -215,7 +306,7 @@ func (p *Packfile) get(h plumbing.Hash) (plumbing.EncodedObject, error) {
 		return nil, err
 	}
 
-	oh, err := p.headerFromOffset(offset)
+	oh, err := p.headerFromOffset(offset, h)
 	if err != nil {
 		return nil, err
 	}
@@ -234,7 +325,7 @@ func (p *Packfile) getByOffset(offset int64) (plumbing.EncodedObject, error) {
 		return obj, nil
 	}
 
-	oh, err := p.headerFromOffset(offset)
+	oh, err := p.headerFromOffset(offset, h)
 	if err != nil {
 		return nil, err
 	}
@@ -319,21 +410,156 @@ func (p *Packfile) init() error {
 	return p.onceErr
 }
 
-func (p *Packfile) headerFromOffset(offset int64) (*ObjectHeader, error) {
+func (p *Packfile) headerFromOffset(offset int64, h plumbing.Hash) (*ObjectHeader, error) {
+	if viewer, ok := p.scanReader.(viewReaderAt); ok {
+		var oh *ObjectHeader
+		_, err := viewer.ViewAt(offset, objectHeaderViewSize, func(data []byte) error {
+			var err error
+			oh, err = readObjectHeaderBytes(data, offset, p.objectIDSize)
+			return err
+		})
+		if !errors.Is(err, errors.ErrUnsupported) {
+			if err != nil && !(err == io.EOF && oh != nil) {
+				return nil, err
+			}
+			oh.Hash = h
+			return oh, nil
+		}
+	}
+
 	err := p.scanner.SeekFromStart(offset)
 	if err != nil {
 		return nil, err
 	}
 
-	if !p.scanner.Scan() {
-		if err := p.scanner.Error(); err != nil {
-			return nil, err
+	oh, err := p.scanner.readObjectHeader()
+	if err != nil {
+		return nil, err
+	}
+	oh.Hash = h
+	return oh, nil
+}
+
+func readObjectHeaderBytes(data []byte, offset int64, objectIDSize int) (*ObjectHeader, error) {
+	pos := 0
+	readByte := func() (byte, error) {
+		if pos >= len(data) {
+			return 0, io.EOF
 		}
-		return nil, plumbing.ErrObjectNotFound
+		b := data[pos]
+		pos++
+		return b, nil
 	}
 
-	oh := p.scanner.Data().Value().(ObjectHeader)
-	return &oh, nil
+	first, err := readByte()
+	if err != nil {
+		return nil, err
+	}
+	typ := packutil.ObjectType(first)
+	if !typ.Valid() {
+		return nil, fmt.Errorf("%w: invalid object type: %v", ErrMalformedPackfile, first)
+	}
+
+	size := uint64(first & 0x0f)
+	for shift := uint(4); first&0x80 != 0; shift += 7 {
+		if shift > 64-7 {
+			return nil, fmt.Errorf("%w: %w", ErrMalformedPackfile, packutil.ErrLengthOverflow)
+		}
+		first, err = readByte()
+		if err != nil {
+			return nil, err
+		}
+		size |= uint64(first&0x7f) << shift
+	}
+
+	oh := &ObjectHeader{
+		Offset:   offset,
+		Type:     typ,
+		diskType: typ,
+		Size:     int64(size),
+	}
+	if typ.IsDelta() {
+		oh.Hash.ResetBySize(objectIDSize)
+	}
+	if typ == plumbing.OFSDeltaObject {
+		c, err := readByte()
+		if err != nil {
+			return nil, err
+		}
+		base := int64(c & 0x7f)
+		for c&0x80 != 0 {
+			if base >= (math.MaxInt64-0x7f)>>7 {
+				return nil, binary.ErrIntegerOverflow
+			}
+			base++
+			c, err = readByte()
+			if err != nil {
+				return nil, err
+			}
+			base = (base << 7) + int64(c&0x7f)
+		}
+		if err := ValidateOFSDeltaBase(offset, base); err != nil {
+			return nil, err
+		}
+		oh.OffsetReference = offset - base
+	} else if typ == plumbing.REFDeltaObject {
+		oh.Reference.ResetBySize(objectIDSize)
+		if len(data)-pos < objectIDSize {
+			if len(data) == pos {
+				return nil, io.EOF
+			}
+			return nil, io.ErrUnexpectedEOF
+		}
+		_, _ = oh.Reference.Write(data[pos : pos+objectIDSize])
+		pos += objectIDSize
+	}
+	oh.ContentOffset = offset + int64(pos)
+	return oh, nil
+}
+
+func (p *Packfile) inflateContent(contentOffset int64, writer io.Writer, declaredSize int64) error {
+	viewer, ok := p.scanReader.(viewReaderFrom)
+	if !ok {
+		return p.scanner.inflateContent(contentOffset, writer, declaredSize)
+	}
+	err := viewer.ViewFrom(contentOffset, func(data []byte) error {
+		p.view.Reset(data)
+		defer p.view.Reset(nil)
+		zr, err := gogitsync.GetZlibReader(&p.view)
+		if err != nil {
+			return fmt.Errorf("zlib reset error: %w", err)
+		}
+		defer gogitsync.PutZlibReader(zr)
+		_, err = ioutil.CopyBufferPool(&boundedWriter{w: writer, limit: declaredSize}, zr)
+		return err
+	})
+	if errors.Is(err, errors.ErrUnsupported) {
+		return p.scanner.inflateContent(contentOffset, writer, declaredSize)
+	}
+	return err
+}
+
+func (p *Packfile) deltaTargetSize(contentOffset int64) (int64, error) {
+	viewer, ok := p.scanReader.(viewReaderFrom)
+	if ok {
+		var size int64
+		err := viewer.ViewFrom(contentOffset, func(data []byte) error {
+			p.view.Reset(data)
+			defer p.view.Reset(nil)
+			zr, err := gogitsync.GetZlibReader(&p.view)
+			if err != nil {
+				return fmt.Errorf("zlib reset error: %w", err)
+			}
+			defer gogitsync.PutZlibReader(zr)
+			size, err = readDeltaTargetSize(zr)
+			return err
+		})
+		if !errors.Is(err, errors.ErrUnsupported) {
+			return size, err
+		}
+	}
+
+	return p.scanner.deltaTargetSize(contentOffset)
 }
 
 // Close the packfile and its resources. Subsequent calls to [Packfile.Get],
@@ -407,6 +633,14 @@ func (p *Packfile) objectFromHeader(oh *ObjectHeader) (plumbing.EncodedObject, e
 	return p.getMemoryObject(oh)
 }
 
+func (p *Packfile) putObject(hash plumbing.Hash, object plumbing.EncodedObject) {
+	if cache, ok := p.cache.(knownHashObjectCache); ok {
+		cache.PutWithHash(hash, object)
+		return
+	}
+	p.cache.Put(object)
+}
+
 func (p *Packfile) getMemoryObject(oh *ObjectHeader) (plumbing.EncodedObject, error) {
 	of := format.SHA1
 	if p.objectIDSize == format.SHA256.Size() {
@@ -426,7 +660,7 @@ func (p *Packfile) getMemoryObject(oh *ObjectHeader) (plumbing.EncodedObject, er
 
 	switch oh.Type {
 	case plumbing.CommitObject, plumbing.TreeObject, plumbing.BlobObject, plumbing.TagObject:
-		err = p.scanner.inflateContent(oh.ContentOffset, w, oh.Size)
+		err = p.inflateContent(oh.ContentOffset, w, oh.Size)
 
 	case plumbing.REFDeltaObject, plumbing.OFSDeltaObject:
 		var parent plumbing.EncodedObject
@@ -446,20 +680,15 @@ func (p *Packfile) getMemoryObject(oh *ObjectHeader) (plumbing.EncodedObject, er
 			return nil, fmt.Errorf("cannot find base object: %w", err)
 		}
 
-		// The scanner pre-populates oh.content for delta objects when
-		// running outside low-memory mode; only inflate when we don't
-		// already hold the bytes, otherwise this would append a
-		// duplicate copy of the delta payload.
-		if oh.content == nil {
-			oh.content = gogitsync.GetBytesBuffer()
-			err = p.scanner.inflateContent(oh.ContentOffset, oh.content, oh.Size)
-			if err != nil {
-				return nil, fmt.Errorf("cannot inflate content: %w", err)
-			}
+		delta := gogitsync.GetBytesBuffer()
+		defer gogitsync.PutBytesBuffer(delta)
+		err = p.inflateContent(oh.ContentOffset, delta, oh.Size)
+		if err != nil {
+			return nil, fmt.Errorf("cannot inflate content: %w", err)
 		}
 
 		obj.SetType(parent.Type())
-		err = ApplyDelta(obj, parent, oh.content)
+		err = ApplyDelta(obj, parent, delta)
 
 	default:
 		err = ErrInvalidObject.AddDetails("type %q", oh.Type)
@@ -469,7 +698,7 @@ func (p *Packfile) getMemoryObject(oh *ObjectHeader) (plumbing.EncodedObject, er
 		return nil, err
 	}
 
-	p.cache.Put(obj)
+	p.putObject(oh.ID(), obj)
 
 	return obj, nil
 }

@@ -173,6 +173,7 @@ func NewStorageWithOptions(fs billy.Filesystem, c cache.Object, ops Options) *St
 	if pool == nil {
 		pool = fdpool.New(defaultPoolCapacity)
 	}
+	ops.Pool = pool
 
 	dirOps := dotgit.Options{
 		ExclusiveAccess:   ops.ExclusiveAccess,

@@ -1,7 +1,9 @@
 package object
 
 import (
+	"encoding/binary"
 	"sort"
+	"strings"
 	"testing"
 
 	fixtures "github.com/go-git/go-git-fixtures/v6"
@@ -76,6 +78,24 @@ func (s *ChangeAdaptorSuite) TestTreeNoderHashHasMode() {
 	expected = append(expected, modeBytes...)
 
 	s.Equal(expected, treeNoder.Hash())
+}
+
+func TestTreeNoderHashSHA256(t *testing.T) {
+	t.Parallel()
+
+	hash := plumbing.NewHash(strings.Repeat("ab", 32))
+	got := (&treeNoder{hash: hash, mode: filemode.Executable}).Hash()
+
+	wantSize := hash.Size() + encodedFileModeSize
+	if len(got) != wantSize {
+		t.Fatalf("hash length = %d, want %d", len(got), wantSize)
+	}
+	if string(got[:hash.Size()]) != string(hash.Bytes()) {
+		t.Fatalf("object ID changed: %x", got[:hash.Size()])
+	}
+	if mode := binary.LittleEndian.Uint32(got[hash.Size():]); mode != uint32(filemode.Executable) {
+		t.Fatalf("mode = %o, want %o", mode, filemode.Executable)
+	}
 }
 
 func (s *ChangeAdaptorSuite) TestNewChangeInsert() {

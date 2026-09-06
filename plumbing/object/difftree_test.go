@@ -1,12 +1,16 @@
 package object
 
 import (
+	"crypto"
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 	"testing"
 
 	fixtures "github.com/go-git/go-git-fixtures/v6"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/go-git/go-git/v6/internal/pathutil"
@@ -72,6 +76,66 @@ func (s *DiffTreeSuite) storageFromPackfile(f *fixtures.Fixture) storer.EncodedO
 func TestDiffTreeSuite(t *testing.T) {
 	t.Parallel()
 	suite.Run(t, new(DiffTreeSuite))
+}
+
+func TestDiffTreeConcurrentSharedTree(t *testing.T) {
+	t.Parallel()
+
+	const (
+		entryName = "file"
+		dirName   = "dir"
+		workers   = 8
+	)
+	store := memory.NewStorage()
+	fromSubtree := newRawTreeObject(t, encodeRawTreeEntries(
+		rawTreeEntry{"100644", entryName, make([]byte, crypto.SHA1.Size())},
+	))
+	fromSubtreeHash, err := store.SetEncodedObject(fromSubtree)
+	require.NoError(t, err)
+
+	toFileHash := make([]byte, crypto.SHA1.Size())
+	toFileHash[0] = 1
+	toSubtree := newRawTreeObject(t, encodeRawTreeEntries(
+		rawTreeEntry{"100644", entryName, toFileHash},
+	))
+	toSubtreeHash, err := store.SetEncodedObject(toSubtree)
+	require.NoError(t, err)
+
+	from := &Tree{
+		s:       store,
+		Hash:    plumbing.NewHash("01"),
+		Entries: []TreeEntry{{Name: dirName, Mode: filemode.Dir, Hash: fromSubtreeHash}},
+	}
+	to := &Tree{
+		s:       store,
+		Hash:    plumbing.NewHash("02"),
+		Entries: []TreeEntry{{Name: dirName, Mode: filemode.Dir, Hash: toSubtreeHash}},
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for range workers {
+		wg.Go(func() {
+			changes, diffErr := DiffTree(from, to)
+			if diffErr != nil {
+				errs <- diffErr
+				return
+			}
+			if len(changes) != 1 {
+				errs <- fmt.Errorf("changes = %d, want 1", len(changes))
+				return
+			}
+			errs <- nil
+		})
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+
+	assert.Nil(t, from.t)
+	assert.False(t, from.entriesSorted)
 }
 
 type expectChange struct {

@@ -136,25 +136,35 @@ func (iter *Iter) Step() (noder.Path, error) {
 // are no more elements in the trie below the base, it returns nil, and
 // io.EOF.  Returns nil and an error in case of errors.
 func (iter *Iter) advance(wantDescend bool) (noder.Path, error) {
-	current, err := iter.current()
-	if err != nil {
-		return nil, err
-	}
-
 	// The first time we just return the current node.
 	if !iter.hasStarted {
+		current, err := iter.current()
+		if err != nil {
+			return nil, err
+		}
 		iter.hasStarted = true
 		return current, nil
+	}
+	topFrame, ok := iter.top()
+	if !ok {
+		return nil, io.EOF
+	}
+	current, ok := topFrame.First()
+	if !ok {
+		return nil, io.EOF
 	}
 
 	// Advances means getting a next current node, either its first child or
 	// its next sibling, depending if we must descend or not.
-	numChildren, err := current.NumChildren()
-	if err != nil {
-		return nil, err
+	mustDescend := false
+	if wantDescend {
+		numChildren, err := current.NumChildren()
+		if err != nil {
+			return nil, err
+		}
+		mustDescend = numChildren != 0
 	}
 
-	mustDescend := numChildren != 0 && wantDescend
 	if mustDescend {
 		// descend: add a new frame with the current's children.
 		frame, err := frame.New(current)
